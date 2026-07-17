@@ -1,0 +1,156 @@
+#!/usr/bin/python3
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QApplication,
+    QColorDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+# Allow importing ../elc_ng.py
+HERE = Path(__file__).resolve().parent
+PARENT = HERE.parent
+if str(PARENT) not in sys.path:
+    sys.path.insert(0, str(PARENT))
+
+from elc_ng import ELC, set_static_color  # noqa: E402
+
+
+VID = 0x187C
+PID = 0x0550
+
+
+class ColorWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Dell LED Color")
+        self.resize(360, 220)
+
+        self.current_color = QColor(0, 255, 0)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        root = QVBoxLayout(central)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        title = QLabel("Dell / AlienFX color")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        root.addWidget(title)
+
+        self.preview = QFrame()
+        self.preview.setFixedHeight(56)
+        self.preview.setFrameShape(QFrame.StyledPanel)
+        self.preview.setStyleSheet("border-radius: 10px; border: 1px solid palette(mid);")
+        root.addWidget(self.preview)
+
+        self.rgb_label = QLabel()
+        self.rgb_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.rgb_label)
+
+        preset_layout = QGridLayout()
+        preset_layout.setHorizontalSpacing(8)
+        preset_layout.setVerticalSpacing(8)
+        root.addLayout(preset_layout)
+
+        presets = [
+            ("Red", (255, 0, 0)),
+            ("Green", (0, 255, 0)),
+            ("Blue", (0, 0, 255)),
+            ("White", (255, 255, 255)),
+            ("Off", (0, 0, 0)),
+            ("Orange", (255, 128, 0)),
+        ]
+
+        for i, (name, rgb) in enumerate(presets):
+            btn = QPushButton(name)
+            btn.clicked.connect(lambda checked=False, rgb=rgb: self.set_color(*rgb))
+            preset_layout.addWidget(btn, i // 3, i % 3)
+
+        buttons = QHBoxLayout()
+        root.addLayout(buttons)
+
+        choose_btn = QPushButton("Choose color…")
+        choose_btn.clicked.connect(self.choose_color)
+        buttons.addWidget(choose_btn)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self.apply_color)
+        buttons.addWidget(apply_btn)
+
+        self.status_label = QLabel("Ready.")
+        self.status_label.setStyleSheet("color: palette(mid);")
+        root.addWidget(self.status_label)
+
+        self.refresh_preview()
+
+    def set_color(self, r, g, b):
+        self.current_color = QColor(r, g, b)
+        self.refresh_preview()
+
+    def refresh_preview(self):
+        r = self.current_color.red()
+        g = self.current_color.green()
+        b = self.current_color.blue()
+        hex_value = self.current_color.name().upper()
+
+        self.preview.setStyleSheet(
+            f"""
+            QFrame {{
+                background-color: rgb({r}, {g}, {b});
+                border-radius: 10px;
+                border: 1px solid palette(mid);
+            }}
+            """
+        )
+        self.rgb_label.setText(f"RGB: {r}, {g}, {b}    HEX: {hex_value}")
+
+    def choose_color(self):
+        color = QColorDialog.getColor(self.current_color, self, "Choose LED color")
+        if color.isValid():
+            self.current_color = color
+            self.refresh_preview()
+
+    def apply_color(self):
+        r = self.current_color.red()
+        g = self.current_color.green()
+        b = self.current_color.blue()
+
+        self.status_label.setText("Applying…")
+        QApplication.processEvents()
+
+        try:
+            elc = ELC(VID, PID)
+            set_static_color(elc, r, g, b)
+            self.status_label.setText(f"Applied: rgb({r}, {g}, {b})")
+        except Exception as e:
+            self.status_label.setText("Failed.")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Could not apply color.\n\n{type(e).__name__}: {e}",
+            )
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = ColorWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+

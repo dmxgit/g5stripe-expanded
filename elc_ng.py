@@ -3,6 +3,8 @@ import struct
 import typing
 
 import usb
+import usb.util
+
 
 @dataclass
 class Response:
@@ -38,12 +40,9 @@ class CommandWithSubcommand(Command):
     subcommand: str
 
     def __post_init__(self):
-        if(
-            self.subcommand and
-            self.subcommand not in self.subcommands
-        ):
+        if self.subcommand and self.subcommand not in self.subcommands:
             raise AttributeError(
-                f'Invalid subcommand for {type(self).__name__}.'
+                f'Invalid subcommand for {type(self).__name__}. '
                 f'Valid choices are: {", ".join(self.subcommands)}.'
             )
 
@@ -89,14 +88,10 @@ class AnimationCountResponse(Response):
 @dataclass
 class QueryCommand(CommandWithSubcommand):
     opcode = 0x20
-    # XXX: Some aren't implemented on hardware?
     subcommands = {
         'version': 0x00,
-        # 'status': 0x01,
         'platform': 0x02,
         'animation_count': 0x03,
-        # 'animation_by_id': 0x04,
-        # 'series': 0x05,
     }
     response_classes = {
         'version': VersionResponse,
@@ -130,9 +125,7 @@ class AnimationCommand(CommandWithSubcommand):
 
     def __post_init__(self):
         super().__post_init__()
-        self.opcode = (
-            0x21 if self.is_power_animation else 0x22
-        )
+        self.opcode = 0x21 if self.is_power_animation else 0x22
 
     @property
     def is_power_animation(self):
@@ -263,6 +256,8 @@ class ELC:
 
     usb_device: usb.core.Device = field(init=False, compare=False)
     attached: bool = field(default=False, init=False, compare=False)
+    reattach_kernel: bool = field(default=False, init=False, compare=False)
+    interface_number: int = field(default=0, init=False, compare=False)
 
     def __post_init__(self):
         vid, pid = self.vid, self.pid
@@ -289,41 +284,64 @@ class ELC:
         self._attach()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc, tb):
         self._detach()
+        return False
 
     def _attach(self):
         device = self.usb_device
+        intf = self.interface_number
+        self.reattach_kernel = False
 
-        if device.is_kernel_driver_active(0):
-            device.detach_kernel_driver(0)
+        try:
+            if device.is_kernel_driver_active(intf):
+                device.detach_kernel_driver(intf)
+                self.reattach_kernel = True
+        except (NotImplementedError, usb.core.USBError):
+            self.reattach_kernel = False
 
         default_configuration = device.configurations()[0]
         current_configuration = None
 
         try:
             current_configuration = device.get_active_configuration()
-        except usb.USBError:
-            # No active configuration
+        except usb.core.USBError:
             pass
 
-        if(
+        if (
             not current_configuration
             or current_configuration.bConfigurationValue
             != default_configuration.bConfigurationValue
         ):
             device.set_configuration()
 
+        try:
+            usb.util.claim_interface(device, intf)
+        except usb.core.USBError:
+            pass
+
         self.attached = True
 
     def _detach(self):
         device = self.usb_device
+        intf = self.interface_number
 
-        if not device.is_kernel_driver_active(0):
-            usb.util.release_interface(device, 0)
-            device.attach_kernel_driver(0)
+        try:
+            usb.util.release_interface(device, intf)
+        except usb.core.USBError:
+            pass
+
+        usb.util.dispose_resources(device)
+
+        if self.reattach_kernel:
+            try:
+                device.attach_kernel_driver(intf)
+            except usb.core.USBError as e:
+                if getattr(e, "errno", None) != 2:
+                    raise
 
         self.attached = False
+        self.reattach_kernel = False
 
     def execute(self, command: Command) -> Response:
         if not self.attached:
@@ -350,6 +368,308 @@ class ELC:
             usb.REQ_CLEAR_FEATURE,
             0x101,
             0,
-            33  # Expected length of response
+            33
         )
 
+
+# ---- Dell / AlienFX helpers aligned with humanfx (USB 187c:0550) ----
+
+ZONE_LEFT = 0x00
+ZONE_MIDDLE_LEFT = 0x01
+ZONE_MIDDLE_RIGHT = 0x02
+ZONE_RIGHT = 0x03
+ZONE_ALL = [ZONE_LEFT, ZONE_MIDDLE_LEFT, ZONE_MIDDLE_RIGHT, ZONE_RIGHT]
+
+
+class ZoneSelectCommand(Command):
+    command = 0x23
+
+    def __init__(self, loop, zones):
+        self.loop = int(loop) & 0xFF
+        self.zones = [int(z) & 0xFF for z in zones]
+
+    def raw(self):
+        count = len(self.zones)
+        return bytes([
+            0x03,
+            self.command,
+            self.loop,
+            (count >> 8) & 0xFF,
+            count & 0xFF,
+            *self.zones,
+        ])
+
+
+class SetDimCommand(Command):
+    command = 0x26
+
+    def __init__(self, dim, zones):
+        self.dim = int(dim) & 0xFF
+        self.zones = [int(z) & 0xFF for z in zones]
+
+    def raw(self):
+        count = len(self.zones)
+        return bytes([
+            0x03,
+            self.command,
+            self.dim,
+            (count >> 8) & 0xFF,
+            count & 0xFF,
+            *self.zones,
+        ])
+
+
+class Action:
+    TYPES = {
+        "color": 0x00,
+        "pulse": 0x01,
+        "morph": 0x02,
+    }
+
+    def __init__(self, kind, r, g, b, duration=5000, tempo=60):
+        if kind not in self.TYPES:
+            raise ValueError(f"Unknown action kind: {kind}")
+        self.kind = kind
+        self.action = self.TYPES[kind]
+        self.r = int(r) & 0xFF
+        self.g = int(g) & 0xFF
+        self.b = int(b) & 0xFF
+        self.duration = int(duration) & 0xFFFF
+        self.tempo = int(tempo) & 0xFFFF
+
+    def raw(self):
+        return bytes([
+            0x03,
+            0x24,
+            self.action & 0xFF,
+            (self.duration >> 8) & 0xFF,
+            self.duration & 0xFF,
+            (self.tempo >> 8) & 0xFF,
+            self.tempo & 0xFF,
+            self.r,
+            self.g,
+            self.b,
+        ])
+
+
+class AddActionsCommand(Command):
+    def __init__(self, actions):
+        self.actions = list(actions)
+        if len(self.actions) != 1:
+            raise ValueError("This implementation currently sends exactly one action per command")
+
+    def raw(self):
+        return self.actions[0].raw()
+
+
+class AnimationCommand(Command):
+    command = 0x21
+
+    SUBCOMMANDS = {
+        "start_new": 0x0001,
+        "config_start": 0x0001,
+
+        "finish_save": 0x0002,
+        "config_save": 0x0002,
+        "save": 0x0002,
+
+        "config_play": 0x0003,
+
+        "remove": 0x0004,
+
+        "play": 0x0005,
+        "animation_play": 0x0005,
+
+        "set_default": 0x0006,
+        "set_startup": 0x0007,
+    }
+
+    def __init__(self, op, animation_id):
+        if op not in self.SUBCOMMANDS:
+            raise ValueError(f"Unknown animation op: {op}")
+        self.op = op
+        self.subcommand = self.SUBCOMMANDS[op]
+        self.animation_id = int(animation_id) & 0xFFFF
+
+    def raw(self):
+        return bytes([
+            0x03,
+            self.command,
+            (self.subcommand >> 8) & 0xFF,
+            self.subcommand & 0xFF,
+            (self.animation_id >> 8) & 0xFF,
+            self.animation_id & 0xFF,
+        ])
+
+# ---- FIX v2: classes compatibles avec la base Command existante ----
+
+ZONE_LEFT = 0x00
+ZONE_MIDDLE_LEFT = 0x01
+ZONE_MIDDLE_RIGHT = 0x02
+ZONE_RIGHT = 0x03
+ZONE_ALL = [ZONE_LEFT, ZONE_MIDDLE_LEFT, ZONE_MIDDLE_RIGHT, ZONE_RIGHT]
+
+
+class ZoneSelectCommand(Command):
+    opcode = 0x23
+
+    def __init__(self, loop, zones):
+        self.loop = int(loop) & 0xFF
+        self.zones = [int(z) & 0xFF for z in zones]
+
+    def payload(self):
+        count = len(self.zones)
+        return bytes([
+            0x03,
+            self.opcode,
+            self.loop,
+            (count >> 8) & 0xFF,
+            count & 0xFF,
+            *self.zones,
+        ])
+
+
+class SetDimCommand(Command):
+    opcode = 0x26
+
+    def __init__(self, dim, zones):
+        self.dim = int(dim) & 0xFF
+        self.zones = [int(z) & 0xFF for z in zones]
+
+    def payload(self):
+        count = len(self.zones)
+        return bytes([
+            0x03,
+            self.opcode,
+            self.dim,
+            (count >> 8) & 0xFF,
+            count & 0xFF,
+            *self.zones,
+        ])
+
+
+class Action:
+    TYPES = {
+        "color": 0x00,
+        "pulse": 0x01,
+        "morph": 0x02,
+    }
+
+    def __init__(self, kind, r, g, b, duration=5000, tempo=60):
+        if kind not in self.TYPES:
+            raise ValueError(f"Unknown action kind: {kind}")
+        self.kind = kind
+        self.action = self.TYPES[kind]
+        self.r = int(r) & 0xFF
+        self.g = int(g) & 0xFF
+        self.b = int(b) & 0xFF
+        self.duration = int(duration) & 0xFFFF
+        self.tempo = int(tempo) & 0xFFFF
+
+    def as_payload(self):
+        return bytes([
+            0x03,
+            0x24,
+            self.action & 0xFF,
+            (self.duration >> 8) & 0xFF,
+            self.duration & 0xFF,
+            (self.tempo >> 8) & 0xFF,
+            self.tempo & 0xFF,
+            self.r,
+            self.g,
+            self.b,
+        ])
+
+
+class AddActionsCommand(Command):
+    opcode = 0x24
+
+    def __init__(self, actions):
+        self.actions = list(actions)
+        if len(self.actions) != 1:
+            raise ValueError("This implementation currently sends exactly one action per command")
+
+    def payload(self):
+        return self.actions[0].as_payload()
+
+
+class AnimationCommand(Command):
+    opcode = 0x21
+
+    SUBCOMMANDS = {
+        "start_new": 0x0001,
+        "config_start": 0x0001,
+
+        "finish_save": 0x0002,
+        "config_save": 0x0002,
+        "save": 0x0002,
+
+        "config_play": 0x0003,
+
+        "remove": 0x0004,
+
+        "play": 0x0005,
+        "animation_play": 0x0005,
+
+        "set_default": 0x0006,
+        "set_startup": 0x0007,
+    }
+
+    def __init__(self, op, animation_id):
+        if op not in self.SUBCOMMANDS:
+            raise ValueError(f"Unknown animation op: {op}")
+        self.op = op
+        self.subcommand = self.SUBCOMMANDS[op]
+        self.animation_id = int(animation_id) & 0xFFFF
+
+    def payload(self):
+        return bytes([
+            0x03,
+            self.opcode,
+            (self.subcommand >> 8) & 0xFF,
+            self.subcommand & 0xFF,
+            (self.animation_id >> 8) & 0xFF,
+            self.animation_id & 0xFF,
+        ])
+
+def _clamp_u8(v):
+    v = int(v)
+    if v < 0:
+        return 0
+    if v > 255:
+        return 255
+    return v
+
+
+def set_brightness(elc, brightness, zones=None):
+    if zones is None:
+        zones = ZONE_ALL
+
+    brightness = max(0, min(100, int(brightness)))
+    dim = 100 - brightness
+
+    with elc:
+        elc.execute(SetDimCommand(dim, zones))
+
+    return brightness
+
+def set_static_color(elc, r, g, b, animation_id=1, zones=None, duration=5000, tempo=60):
+    if zones is None:
+        zones = ZONE_ALL
+
+    r = _clamp_u8(r)
+    g = _clamp_u8(g)
+    b = _clamp_u8(b)
+
+    with elc:
+        elc.execute(AnimationCommand("remove", animation_id))
+        elc.execute(AnimationCommand("config_start", animation_id))
+        elc.execute(ZoneSelectCommand(1, zones))
+        elc.execute(AddActionsCommand([
+            Action("color", r, g, b, duration=duration, tempo=tempo)
+        ]))
+        elc.execute(AnimationCommand("config_play", 0))
+        elc.execute(AnimationCommand("config_save", animation_id))
+        elc.execute(AnimationCommand("set_default", animation_id))
+
+    return (r, g, b)

@@ -21,6 +21,7 @@ https://gitlab.com/CalcProgrammer1/OpenRGB/-/issues/2507
 
 -Cecil Coupe, Feb 15, 2023
 
+NOTES from Denis Marcoux (June 2026)
 From:
 https://gist.github.com/Cheaterman/2d166b510adc5eb9d582eaa83282c410
 and
@@ -28,3 +29,5 @@ https://gist.github.com/Cheaterman/accd912c6886f4055f45d0594b88553c
 
 Found in this discussion
 https://github.com/rsm-gh/akbl/issues/74
+
+Read the README.md for a full description of the forked project
